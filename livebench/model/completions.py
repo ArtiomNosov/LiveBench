@@ -11,6 +11,13 @@ logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
 
 import httpx
 
+from openai import Stream
+from openai.types.chat import ChatCompletionChunk, ChatCompletion
+from tenacity import retry, stop_after_attempt, retry_if_exception_type, wait_fixed, wait_incrementing
+
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
+
+
 logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from giga import GigaChat
@@ -19,7 +26,8 @@ if TYPE_CHECKING:
 
 # API setting constants
 API_MAX_RETRY = 3
-API_RETRY_SLEEP = 10
+API_RETRY_SLEEP_MIN = 10
+API_RETRY_SLEEP_MAX = 60
 API_ERROR_OUTPUT = "$ERROR$"
 
 CLIENT: Optional["GigaChat"] = None
@@ -40,13 +48,13 @@ def retry_log(retry_state):
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
 )
 def chat_completion_openai(
-    model: "Model", conv, temperature, max_tokens, api_dict=None
+    model: str, messages: Conversation, temperature: float, max_tokens: int, model_api_kwargs: API_Kwargs | None = None, api_dict: dict[str, str] | None = None, stream: bool = False
 ) -> tuple[str, int]:
     from openai import NOT_GIVEN, OpenAI
 
@@ -70,6 +78,14 @@ def chat_completion_openai(
         if model.inference_api:
             messages[0]["content"] = "Formatting reenabled\n" + messages[0]["content"]
     try:
+        if stream:
+            stream: Stream[ChatCompletionChunk] = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                stream_options={'include_usage': True},
+                **actual_api_kwargs
+            )
 
         response = client.chat.completions.create(
             model=model.api_name,
@@ -96,23 +112,20 @@ def chat_completion_openai(
         message = response.choices[0].message.content
         if message is None:
             raise Exception("No message returned from OpenAI")
+        if num_tokens is None:
+            num_tokens = -1
         output = message
-        num_tokens = response.usage.completion_tokens
 
         return output, num_tokens
     except Exception as e:
         if "invalid_prompt" in str(e).lower():
-            print("invalid prompt, giving up")
-            return API_ERROR_OUTPUT, 0
-        elif "timeout" in str(e).lower():
-            print("timeout, giving up")
+            print("invalid prompt (model refusal), giving up")
             return API_ERROR_OUTPUT, 0
         raise e
 
-
 @retry(
-    stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    stop=stop_after_attempt(1),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
@@ -261,6 +274,11 @@ def chat_completion_nvidia(
 
     return message, response.usage.completion_tokens
 
+    # Set up API kwargs
+    inference_config = {
+        "maxTokens": max_tokens,
+        "temperature": temperature,
+    }
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
@@ -277,18 +295,12 @@ def chat_completion_xai(
     else:
         api_key = os.environ["XAI_API_KEY"]
 
-    from openai import OpenAI
-
-    client = OpenAI(base_url="https://api.x.ai/v1", api_key=api_key)
-    messages = conv.to_openai_api_messages()
-
-    response = client.chat.completions.create(
-        model=model.api_name,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        n=1,
-        stream=False,
+   
+    # Make the API call
+    response = brt.converse(
+        modelId=model,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig=inference_config,
     )
     message = response.choices[0].message.content
     if message is None:
@@ -296,6 +308,22 @@ def chat_completion_xai(
 
     return message, response.usage.completion_tokens
 
+    return output, num_tokens
+
+
+incremental_wait = wait_incrementing(start=API_RETRY_SLEEP_MIN, max=API_RETRY_SLEEP_MAX, increment=20)
+
+def gemini_custom_wait(retry_state):
+    if retry_state.outcome.failed:
+        exception = retry_state.outcome.exception()
+        if exception and "RECITATION" in str(exception) or "MAX_TOKENS" in str(exception):
+            return 0.0  # don't wait for recitation or max token errors
+
+    val = incremental_wait(retry_state)
+    print(f"Waiting for {val} seconds before retrying attempt {retry_state.attempt_number + 1}")
+
+    # other errors might indicate rate limiting, wait for these
+    return val
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
@@ -331,7 +359,7 @@ def chat_completion_vertex(
     retry_error_callback=retry_fail,
 )
 def chat_completion_google_generativeai(
-    model, conv, temperature, max_tokens, api_dict=None
+    model: str, messages: Conversation, temperature: float, max_tokens: int, model_api_kwargs: API_Kwargs | None = None, api_dict: dict[str, str] | None = None, stream: bool = False
 ) -> tuple[str, int]:
     from google import genai
     from google.genai import types
@@ -371,9 +399,14 @@ def chat_completion_google_generativeai(
 
     config = types.GenerateContentConfig(**kwargs)
 
+    config = types.GenerateContentConfig(**api_kwargs)
+    
     response = client.models.generate_content(
         model=model.api_name, contents=prompt, config=config
     )
+    
+    if response is None or response.text is None:
+        raise Exception("No response returned from Google")
 
     if (
         response is None
@@ -417,7 +450,7 @@ def chat_completion_google_generativeai(
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
@@ -475,9 +508,7 @@ def chat_completion_openai_azure(
     response = client.chat.completions.create(
         engine=model.api_name,
         messages=messages,
-        n=1,
-        temperature=temperature,
-        max_tokens=max_tokens,
+        **api_kwargs
     )
     output = response.choices[0].message.content
     if output is None:
@@ -488,7 +519,7 @@ def chat_completion_openai_azure(
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
@@ -519,7 +550,7 @@ def chat_completion_anthropic(
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
@@ -535,16 +566,31 @@ def chat_completion_mistral(
     from mistralai import Mistral
 
     client = Mistral(api_key=api_key)
+    
+    # Set up API kwargs
+    api_kwargs: API_Kwargs = {
+        'max_tokens': max_tokens,
+        'temperature': temperature
+    }
+    if model_api_kwargs is not None:
+        model_api_kwargs = {key: value for key, value in model_api_kwargs.items()}
+        api_kwargs.update(model_api_kwargs)
 
-    messages = conv.to_openai_api_messages()
+    actual_api_kwargs = {key: (value if value is not None else UNSET) for key, value in api_kwargs.items()}
+
     chat_response = client.chat.complete(
-        model=model.api_name,
-        max_tokens=max_tokens,
-        temperature=temperature,
+        model=model,
         messages=messages,
+        **actual_api_kwargs
     )
-
-    if chat_response.choices[0].message.content is None:
+    
+    if chat_response is None:
+        raise Exception("No response returned from Mistral")
+    elif not hasattr(chat_response, 'choices') or not chat_response.choices:
+        raise Exception("No choices returned from Mistral")
+    
+    message = chat_response.choices[0].message.content
+    if message is None:
         raise Exception("No message returned from Mistral")
 
     return (
@@ -552,10 +598,11 @@ def chat_completion_mistral(
         chat_response.usage.completion_tokens,
     )
 
+    return message.strip(), num_tokens
 
 @retry(
     stop=stop_after_attempt(API_MAX_RETRY),
-    wait=wait_fixed(API_RETRY_SLEEP),
+    wait=wait_fixed(API_RETRY_SLEEP_MIN),
     retry=retry_if_exception_type(Exception),
     after=retry_log,
     retry_error_callback=retry_fail,
@@ -566,7 +613,7 @@ def chat_completion_cohere(
     if api_dict is not None and "api_key" in api_dict:
         api_key = api_dict["api_key"]
     else:
-        api_key = os.environ["CO_API_KEY"]
+        api_key = os.environ["DEEPINFRA_API_KEY"]
 
     import cohere
 

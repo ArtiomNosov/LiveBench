@@ -84,7 +84,7 @@ def reorg_output_file(output_file):
             fout.write(judgments[key])
 
 
-def play_a_match_gt(match: MatchSingle, output_file: str, debug=False):
+def play_a_match_gt(match: MatchSingle, output_file: str | None = None, debug=False):
     """
     Evaluate a model's answer to a question.
 
@@ -155,8 +155,11 @@ def play_a_match_gt(match: MatchSingle, output_file: str, debug=False):
         elif "amps_hard" in task_or_subtask:
             score = amps_hard_process_results(ground_truth, llm_answer, debug)
             category = "math"
-        elif task_or_subtask == "web_of_lies_v2":
-            score = web_of_lies_process_results(ground_truth, llm_answer, debug)
+        elif task_or_subtask == "web_of_lies_v2" or task_or_subtask == "web_of_lies_v3":
+            if task_or_subtask == "web_of_lies_v2":
+                score = web_of_lies_process_results(ground_truth, llm_answer, debug)
+            else:
+                score = web_of_lies_v3_process_results(ground_truth, llm_answer, debug)
             category = "reasoning"
         elif task_or_subtask == "house_traversal":
             score = house_traversal_process_results(ground_truth, llm_answer, debug)
@@ -184,7 +187,16 @@ def play_a_match_gt(match: MatchSingle, output_file: str, debug=False):
             category = "language"
         elif task_or_subtask in coding_test_case_tasks:
             # use entire question object, because there are test cases inside.
-            score = LCB_generation_process_results(question, llm_answer, debug)
+            if task_or_subtask == "LCB_generation" or task_or_subtask == "coding_completion":
+                score = LCB_generation_process_results(question, llm_answer, debug)
+            elif task_or_subtask == "code_generation" or task_or_subtask == "code_completion":
+                score = code_generation_process_results(question, llm_answer, debug)
+            elif task_or_subtask == "agentic_coding":
+                # Check for litellm and Docker availability
+                if not check_agentic_coding_requirements():
+                    score = 0  # Return 0 score when requirements are not met
+                else:
+                    score = agentic_coding_process_results(question, answer, debug)
             category = "coding"
         else:
             raise NotImplementedError(
@@ -198,16 +210,18 @@ def play_a_match_gt(match: MatchSingle, output_file: str, debug=False):
     if not category:
         raise NotImplementedError(f"A category must be assigned to each task")
     question_id = question["question_id"]
-    turn = 1
     result = {
         "question_id": question_id,
         "task": task,
         "model": model,
         "score": score,
-        "turn": turn,
         "tstamp": time.time(),
         "category": category,
     }
+    # Add answer_id if available
+    if "answer_id" in answer:
+        result["answer_id"] = answer["answer_id"]
+    
     if "subtask" in question.keys():
         result["subtask"] = question["subtask"]
     print(
@@ -245,17 +259,28 @@ def gen_judgments(
         remove_existing_file: Whether to remove an existing judgment output file or append
         bench_name: The subset of LiveBench for which answers should be evaluated (e.g. 'live_bench' or 'live_bench/coding')
         parallel: The number of concurrent threads to use for evaluating answers
+        resume: When true, skip question-model pairs that already have judgments in the output file
+        only_incorrect: When true (and resume is true), only re-evaluate questions that previously scored 0
     """
-    # Load answers
-    model_answers = load_model_answers(answer_dir)
+
+    if "agentic_coding" in bench_name:
+        # Check for litellm and Docker availability
+        if not check_agentic_coding_requirements():
+            print("Warning: litellm or docker missing, skipping agentic coding evaluation")
+            return
+
 
     if model_list is None:
         # evaluate answers for all models who have answers in answer_dir
         models = get_model_list(answer_dir)
+        models = [m for m in models if m != 'deepseek-chat']
     else:
         models = model_list
 
     print("models:", models)
+
+    # Load answers
+    model_answers = load_model_answers(answer_dir, models)
 
     play_a_match_func = play_a_match_gt
 
@@ -263,6 +288,23 @@ def gen_judgments(
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
     if output_file and os.path.exists(output_file) and remove_existing_file:
         os.remove(output_file)
+
+    # Load existing judgments if in resume mode
+    existing_answer_ids = set()
+    existing_scores = {}  # Store answer_id -> score mapping for only_incorrect mode
+    if resume and os.path.exists(output_file):
+        print(f"Resume mode: Reading existing judgments from {output_file}")
+        with open(output_file, "r") as fin:
+            for line in fin:
+                judgment = json.loads(line)
+                # Only track answer_ids - that's all we use for resuming
+                if "answer_id" in judgment:
+                    answer_id = judgment["answer_id"]
+                    existing_answer_ids.add(answer_id)
+                    # Store score for only_incorrect mode
+                    if only_incorrect and "score" in judgment:
+                        existing_scores[answer_id] = judgment["score"]
+        print(f"Found {len(existing_answer_ids)} existing answer IDs")
 
     make_match_func = make_match_single
     if not ignore_missing_answers:
@@ -276,6 +318,43 @@ def gen_judgments(
 
     if len(matches) == 0:
         print("No question-answer pairs found")
+        return
+
+    # Filter out matches that already have judgments if in resume mode
+    if resume:
+        original_match_count = len(matches)
+        filtered_matches = []
+
+        for match in matches:
+            # Check if this answer has already been evaluated
+            answer = match.answer
+            answer_id = answer.get("answer_id", None)
+
+            # If no answer_id, always include (can't track)
+            if answer_id is None:
+                filtered_matches.append(match)
+                continue
+
+            # If answer_id not in existing judgments, always include
+            if answer_id not in existing_answer_ids:
+                filtered_matches.append(match)
+                continue
+
+            # If we get here, the answer has been evaluated before
+            if only_incorrect:
+                # Only re-evaluate if the previous score was 0
+                previous_score = existing_scores.get(answer_id)
+                if previous_score == 0:
+                    filtered_matches.append(match)
+                # Skip if score was not 0 or if score is missing
+            # If not only_incorrect mode, skip all previously evaluated answers
+
+        matches = filtered_matches
+        print(f"Resume mode: Filtered out {original_match_count - len(matches)} already judged matches")
+
+    if len(matches) == 0:
+        print('No question-answer pairs found to be judged')
+        reorg_output_file(output_file)
         return
 
     match_stat = {}
@@ -301,6 +380,10 @@ def gen_judgments(
         else:
             models = model_list
 
+        for m in model_answers:
+            for q in model_answers[m]:
+                model_answers[m][q]['choices'][0]['turns'][0] = re.sub(f"<think>.*?<\/think>", "", model_answers[m][q]['choices'][0]['turns'][0], flags=re.DOTALL).strip()
+
         for model_id in models:
             scores = instruction_following_process_results(
                 questions, model_answers, task_name, model_id, debug
@@ -318,6 +401,11 @@ def gen_judgments(
                     "tstamp": time.time(),
                     "category": "instruction_following",
                 }
+                # Add answer_id if available
+                answer = model_answers.get(model_id, {}).get(question_id, {})
+                if answer and "answer_id" in answer:
+                    result["answer_id"] = answer["answer_id"]
+                    
                 print(
                     f"question: {question_id}, turn: {turn}, model: {model_id}, "
                     f"score: {score}, "
@@ -327,9 +415,39 @@ def gen_judgments(
                     os.makedirs(os.path.dirname(output_file), exist_ok=True)
                     with open(output_file, "a") as fout:
                         fout.write(json.dumps(result) + "\n")
+    elif "agentic_coding" in bench_name:
+
+        for model_id in models: # TODO: parallelize at the model level too
+            model_matches = [m for m in matches if m.model == model_id]
+            questions = [m.question for m in model_matches]
+            answers = [m.answer for m in model_matches]
+            eval_result = agentic_coding_process_results(questions, answers, debug=debug, max_workers=parallel)
+            for question_id in sorted(eval_result.keys()):
+                model_answer = model_answers[model_id][question_id]
+                question = [q for q in questions if q['question_id'] == question_id][0]
+                result = {
+                    "question_id": question_id,
+                    "task": question['task'],
+                    "model": model_id,
+                    "score": eval_result[question_id],
+                    "tstamp": time.time(),
+                    "category": "agentic_coding",
+                }
+                if "answer_id" in model_answer:
+                    result["answer_id"] = model_answer["answer_id"]
+
+                print(
+                    f"question: {question_id}, model: {model_id}, "
+                    f"score: {eval_result[question_id]}, ")
+                
+                if output_file:
+                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                    with open(output_file, "a") as fout:
+                        fout.write(json.dumps(result) + "\n")
     else:
         # Play matches
-        if parallel == 1:
+        # parallel doesn't work well with the livecodebench eval
+        if parallel == 1 or bench_name == "live_bench/coding/coding_completion" or bench_name == "live_bench/coding/LCB_generation":
             for match in tqdm(matches):
                 results = play_a_match_func(match, output_file=output_file, debug=debug)
         else:
@@ -358,8 +476,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bench-name",
         type=str,
+        nargs="+",
         default="live_bench",
-        help="The name of the benchmark question set. Defaults to 'live_bench', or all tasks in the benchmark. Specify e.g. live_bench/reasoning/web_of_lies_v2 to generate only for that task.",
+        help="The name(s) of the benchmark question set. Defaults to 'live_bench', or all tasks in the benchmark. Specify e.g. live_bench/reasoning/web_of_lies_v2 to generate only for that task.",
     )
     parser.add_argument(
         "--model",
@@ -444,10 +563,11 @@ if __name__ == "__main__":
             if args.model_display_name is not None:
                 model_list.append(args.model_display_name[i].lower())
             else:
-                model_list.append(get_model(model_name).display_name.lower())
+                model_list.append(get_model_config(model_name).display_name.lower())
 
     if args.question_source == "huggingface":
-        categories, tasks = get_categories_tasks(args.bench_name)
+        for bench_name in args.bench_name:
+            categories, tasks = get_categories_tasks(bench_name)
 
         for category_name, task_names in tasks.items():
             for task_name in task_names:

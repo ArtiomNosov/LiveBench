@@ -1,0 +1,14 @@
+---
+display_name: kimi-k2-instruct
+api_name:
+  together: moonshotai/Kimi-K2-Instruct
+  https://api.moonshot.ai/v1: kimi-k2-0711-preview
+  https://openrouter.ai/api/v1: moonshotai/kimi-k2
+default_provider: https://openrouter.ai/api/v1
+api_keys:
+  https://api.moonshot.ai/v1: MOONSHOTAI_API_KEY
+  https://openrouter.ai/api/v1: OPENROUTER_API_KEY
+api_kwargs:
+  default:
+    temperature: 0.6
+    max_tokens: 128000
