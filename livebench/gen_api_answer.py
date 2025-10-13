@@ -5,12 +5,11 @@ python3 gen_api_answer.py --model gpt-3.5-turbo
 """
 
 import argparse
-import concurrent.futures
-import glob
 import json
 import os
 import time
-
+import concurrent.futures
+import glob
 import shortuuid
 import tqdm
 import subprocess
@@ -20,16 +19,17 @@ from livebench.model.api_model_config import APIKwargs, AgentConfig
 from livebench.agentic_code_runner.minisweagent.run_inference import run_agentic_coding_inference
 
 from livebench.common import (
-    LIVE_BENCH_DATA_SUPER_PATH,
     LIVE_BENCH_RELEASES,
-    filter_questions,
+    reorg_answer_file,
     get_categories_tasks,
     load_questions,
     load_questions_jsonl,
-    reorg_answer_file,
+    LIVE_BENCH_DATA_SUPER_PATH,
+    filter_questions,
+    check_agentic_coding_requirements
 )
-from livebench.model import Model, get_model
-from livebench.model.completions import chat_completion_openai
+
+from livebench.model import ModelConfig, get_model_config, get_api_function
 
 
 def get_answer(
@@ -282,8 +282,7 @@ def run_questions(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate benchmark question answers using an API-based model",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Generate benchmark question answers using an API-based model"
     )
     parser.add_argument(
         "--bench-name",
@@ -348,7 +347,7 @@ if __name__ == "__main__":
         "--resume",
         action="store_true",
         default=False,
-        help="Do not generate answers for questions that have already been generated, unless they were errors and --retry-failures is set.",
+        help="Do not generate answers for questions that have already been generated, unless they were errors and --retry-failures is set."
     )
     parser.add_argument(
         "--model-display-name",
@@ -406,31 +405,32 @@ if __name__ == "__main__":
     if args.question_source == "huggingface":
         categories, tasks = get_categories_tasks(args.bench_name)
 
-        for category_name, task_names in tasks.items():
-            for task_name in task_names:
-                questions = load_questions(
-                    categories[category_name],
-                    release_set,
-                    args.livebench_release_option,
-                    task_name,
-                    args.question_id,
-                )
+        # Check if this is an agentic_coding benchmark
+        is_agentic_coding = 'agentic_coding' in args.bench_name
+        
+        if is_agentic_coding:
+            # For agentic_coding, group all questions together but maintain separate answer files
+            all_questions = []
+            task_to_answer_file = {}
+            
+            for category_name, task_names in tasks.items():
+                for task_name in task_names:
+                    questions = load_questions(
+                        categories[category_name],
+                        release_set,
+                        args.livebench_release_option,
+                        task_name,
+                        args.question_id
+                    )
 
-                questions = questions[args.question_begin : args.question_end]
+                    questions = questions[args.question_begin:args.question_end]
 
-                task_full_name = (
-                    f"{LIVE_BENCH_DATA_SUPER_PATH}/{category_name}/{task_name}"
-                )
-                answer_file = (
-                    f"data/{task_full_name}/model_answer/{model.display_name}.jsonl"
-                )
-
-                questions = filter_questions(
-                    questions, answer_file, args.resume, args.retry_failures
-                )
-
-                print(f"Questions from {task_full_name}")
-                print(f"Output to {answer_file}")
+                    task_full_name = (
+                        f"{LIVE_BENCH_DATA_SUPER_PATH}/{category_name}/{task_name}"
+                    )
+                    answer_file = (
+                        f"data/{task_full_name}/model_answer/{model_display_name.lower()}.jsonl"
+                    )
 
                     questions = filter_questions(questions, answer_file, args.resume, args.retry_failures)
                     
@@ -516,26 +516,66 @@ if __name__ == "__main__":
                 f"data/{args.bench_name}/**/question.jsonl", recursive=True
             )
 
-        for question_file in list_of_question_files:
-            print(question_file)
-            questions = load_questions_jsonl(
-                question_file,
-                release_set,
-                args.livebench_release_option,
-                args.question_id,
-            )
-
-            questions = questions[args.question_begin : args.question_end]
+        # Check if this is an agentic_coding benchmark
+        is_agentic_coding = 'agentic_coding' in args.bench_name
+        
+        if is_agentic_coding:
+            # For agentic_coding, group all questions together but maintain separate answer files
+            all_questions = []
+            task_to_answer_file = {}
+            
+            for question_file in list_of_question_files:
+                print(question_file)
+                questions = load_questions_jsonl(
+                    question_file, release_set, args.livebench_release_option, args.question_id
+                )
+                
+                questions = questions[args.question_begin:args.question_end]
 
                 bench_name = os.path.dirname(question_file).replace("data/", "")
                 answer_file = f"data/{bench_name}/model_answer/{model_display_name.lower()}.jsonl"
 
-            questions = filter_questions(
-                questions, answer_file, args.resume, args.retry_failures
-            )
-
-            print(f"Questions from {question_file}")
-            print(f"Output to {answer_file}")
+                questions = filter_questions(questions, answer_file, args.resume, args.retry_failures)
+                
+                # Extract task name from bench_name (assuming format like "live_bench/agentic_coding/task_name")
+                task_name = bench_name.split('/')[-1] if '/' in bench_name else bench_name
+                
+                # Add task information to each question
+                for question in questions:
+                    question['task'] = task_name
+                
+                all_questions.extend(questions)
+                task_to_answer_file[task_name] = answer_file
+                        
+                print(f"Questions from {question_file}")
+                print(f"Output to {answer_file}")
+            
+            if all_questions:
+                print(f"Running {len(all_questions)} agentic_coding questions together")
+                run_questions(
+                    parallel=args.parallel,
+                    questions=all_questions,
+                    model_config=model_config,
+                    model_display_name_override=model_display_name,
+                    num_choices=args.num_choices,
+                    max_tokens=args.max_tokens,
+                    answer_file=None,  # Will use task_to_answer_file mapping instead
+                    api_dict=api_dict,
+                    stream=args.stream,
+                    force_temperature=args.force_temperature,
+                    model_provider_override=args.model_provider_override,
+                    bench_name=args.bench_name,
+                    task_to_answer_file=task_to_answer_file
+                )
+        else:
+            # For non-agentic_coding, process each file separately as before
+            for question_file in list_of_question_files:
+                print(question_file)
+                questions = load_questions_jsonl(
+                    question_file, release_set, args.livebench_release_option, args.question_id
+                )
+                
+                questions = questions[args.question_begin:args.question_end]
 
                 bench_name = os.path.dirname(question_file).replace("data/", "")
                 answer_file = f"data/{bench_name}/model_answer/{model_display_name.lower()}.jsonl"
